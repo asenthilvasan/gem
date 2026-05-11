@@ -2,6 +2,7 @@ import pkgutil
 import os
 from typing import List
 import importlib
+import importlib.util
 
 
 class InstanceLoader():
@@ -27,7 +28,9 @@ class InstanceLoader():
 
         for loader, module_name, is_pkg in pkgutil.walk_packages(folders):
 
-            module = loader.find_module(module_name).load_module(module_name)
+            spec = loader.find_spec(module_name)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
             atr_names = dir(module)
 
             for attr_n in atr_names:
