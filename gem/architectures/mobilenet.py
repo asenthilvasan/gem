@@ -72,7 +72,7 @@ class MobileNetV2(nn.Module):
 
     @staticmethod
     def get_arch_names():
-        return 'mobilenet'
+        return ['mobilenet']
 
     @staticmethod
     def get_config():
