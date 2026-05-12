@@ -243,6 +243,6 @@ class ContrastiveLossClassifier(BasicAugmentation):
             'hybrid_alpha': 0.5,
             'projection_dim': 128,
             'projection_hidden_dim': 0,
-            'projection_head': 'identity',
+            'projection_head': 'mlp',
             'xent_weight': 0.0,
         }
