@@ -183,11 +183,13 @@ class MemoryWrapClassifier(BasicAugmentation):
                     criterion,
                     scheduler=None,
                     regularizer=None,
-                    show_progress=True):
+                    show_progress=True,
+                    scaler=None):
         train_loader, memory_loader = loader
         model.train()
         total_loss = total_acc = num_samples = 0
         memory_iter = iter(memory_loader)
+        use_amp = scaler is not None
         for X, y in tqdm(train_loader, leave=False, disable=not show_progress):
             try:
                 memory_input, _ = next(memory_iter)
@@ -197,12 +199,18 @@ class MemoryWrapClassifier(BasicAugmentation):
             X, y = X.cuda(), y.cuda()
             memory_input = memory_input.cuda()
             optimizer.zero_grad(set_to_none=True)
-            output = model(X, memory_input)
-            loss = criterion(output, y)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                output = model(X, memory_input)
+                loss = criterion(output, y)
             if regularizer is not None:
                 loss = loss + regularizer(model)
-            loss.backward()
-            optimizer.step()
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
             if scheduler is not None:
                 scheduler.step()
             total_loss += loss.item() * len(X)
@@ -216,10 +224,15 @@ class MemoryWrapClassifier(BasicAugmentation):
                        criterion,
                        show_progress=True):
         eval_loader, memory_loader = loader if isinstance(loader, tuple) else (loader, None)
+        if memory_loader is None:
+            raise ValueError(
+                'MemoryWrapClassifier.evaluate_epoch requires a memory loader; '
+                'pass loader=(eval_loader, memory_loader).'
+            )
         model.eval()
         total_loss = total_acc = num_samples = 0
         memory_iter = iter(memory_loader)
-        with torch.no_grad():
+        with torch.no_grad(), torch.cuda.amp.autocast():
             for X, y in tqdm(eval_loader, leave=False, disable=not show_progress):
                 try:
                     memory_input, _ = next(memory_iter)
@@ -317,10 +330,11 @@ class MemoryWrapClassifier(BasicAugmentation):
         criterion = self.get_loss_function()
         optimizer, scheduler = self.get_optimizer(par_model, max_epochs=epochs, max_iter=iterations)
         regularizer = self.get_regularizer()
+        scaler = torch.cuda.amp.GradScaler()
         metrics = self.train_model(
             par_model, (train_loader, memory_loader), (val_loader, val_memory_loader) if val_loader is not None else None,
             optimizer, criterion, epochs,
-            train_args={'scheduler': scheduler, 'regularizer': regularizer, 'show_progress': show_sub_progress},
+            train_args={'scheduler': scheduler, 'regularizer': regularizer, 'show_progress': show_sub_progress, 'scaler': scaler},
             eval_args={'show_progress': show_sub_progress},
             eval_interval=eval_interval, show_progress=show_progress,
             report_tuner=report_tuner,
@@ -331,25 +345,32 @@ class MemoryWrapClassifier(BasicAugmentation):
         test_transform = getattr(self, 'memory_transform', None)
         if test_transform is None:
             _, test_transform = self.get_data_transforms(test_data)
-        test_data.transform = test_transform
         memory_data = getattr(self, 'memory_data', test_data)
-        memory_data.transform = getattr(self, 'memory_transform', test_transform)
-        test_loader = datautil.DataLoader(test_data, batch_size=batch_size, shuffle=False, pin_memory=True)
-        memory_loader = datautil.DataLoader(memory_data, batch_size=self.hparams['mem_batch_size'], shuffle=True, pin_memory=True)
-        criterion = self.get_loss_function()
-        model = model.cuda()
-        accuracies = []
-        balanced_accuracies = []
-        for _ in range(self.hparams['eval_memory_runs']):
-            acc, acc_b, loss = self._evaluate_once(model, test_loader, memory_loader, criterion)
-            accuracies.append(acc)
-            balanced_accuracies.append(acc_b)
-        acc = float(np.mean(accuracies))
-        acc_b = float(np.mean(balanced_accuracies))
-        if print_metrics:
-            print('Accuracy: {:.2%}'.format(acc))
-            print('Balanced accuracy: {:.2%}'.format(acc_b))
-        return {'accuracy': acc, 'balanced_accuracy': acc_b}
+        memory_transform = getattr(self, 'memory_transform', test_transform)
+        prev_test_transform = test_data.transform
+        prev_memory_transform = memory_data.transform
+        test_data.transform = test_transform
+        memory_data.transform = memory_transform
+        try:
+            test_loader = datautil.DataLoader(test_data, batch_size=batch_size, shuffle=False, pin_memory=True)
+            memory_loader = datautil.DataLoader(memory_data, batch_size=self.hparams['mem_batch_size'], shuffle=True, pin_memory=True)
+            criterion = self.get_loss_function()
+            model = model.cuda()
+            accuracies = []
+            balanced_accuracies = []
+            for _ in range(self.hparams['eval_memory_runs']):
+                acc, acc_b, loss = self._evaluate_once(model, test_loader, memory_loader, criterion)
+                accuracies.append(acc)
+                balanced_accuracies.append(acc_b)
+            acc = float(np.mean(accuracies))
+            acc_b = float(np.mean(balanced_accuracies))
+            if print_metrics:
+                print('Accuracy: {:.2%}'.format(acc))
+                print('Balanced accuracy: {:.2%}'.format(acc_b))
+            return {'accuracy': acc, 'balanced_accuracy': acc_b}
+        finally:
+            memory_data.transform = prev_memory_transform
+            test_data.transform = prev_test_transform
 
     def _evaluate_once(self, model: nn.Module, test_loader, memory_loader, criterion):
         gt = []
@@ -357,7 +378,7 @@ class MemoryWrapClassifier(BasicAugmentation):
         total_loss = total_acc = num_samples = 0
         memory_iter = iter(memory_loader)
         model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), torch.cuda.amp.autocast():
             for X, y in test_loader:
                 try:
                     memory_input, _ = next(memory_iter)

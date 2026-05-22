@@ -5,8 +5,10 @@ from torch import nn, Tensor
 from typing import Callable, Optional, Tuple
 from collections import OrderedDict
 
-from gem.pipelines.common import BasicAugmentation, ClassificationMetrics
-from gem.pipelines.distill_visual_priors.contrastive_augmentation import TwoCropsTransform
+from gem.pipelines.common import ClassificationMetrics
+from gem.pipelines.distill_visual_priors.contrastive_augmentation import (
+    ContrastiveAugmentation, TwoCropsTransform,
+)
 from gem.utils import is_notebook
 
 if is_notebook():
@@ -15,36 +17,12 @@ else:
     from tqdm import tqdm
 
 
-class ProjectionHead(nn.Module):
+class EncoderClassifierModel(nn.Module):
 
-    def __init__(self, in_features: int, hidden_dim: int, out_dim: int, head: str):
-        super(ProjectionHead, self).__init__()
-        if head == 'identity':
-            self.net = nn.Identity()
-        elif head == 'linear':
-            self.net = nn.Linear(in_features, out_dim)
-        elif head == 'mlp':
-            hidden_dim = in_features if hidden_dim <= 0 else hidden_dim
-            self.net = nn.Sequential(
-                nn.Linear(in_features, hidden_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, out_dim),
-            )
-        else:
-            raise ValueError(f'Unknown projection head: {head}')
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class EncoderProjectionModel(nn.Module):
-
-    def __init__(self, encoder: nn.Module, num_classes: int, projection_dim: int, projection_hidden_dim: int,
-                 projection_head: str):
-        super(EncoderProjectionModel, self).__init__()
+    def __init__(self, encoder: nn.Module, num_classes: int):
+        super(EncoderClassifierModel, self).__init__()
         self.encoder = encoder
         self.feature_dim = self._prepare_encoder()
-        self.projection = ProjectionHead(self.feature_dim, projection_hidden_dim, projection_dim, projection_head)
         self.classifier = nn.Linear(self.feature_dim, num_classes)
 
     def _prepare_encoder(self) -> int:
@@ -70,8 +48,8 @@ class EncoderProjectionModel(nn.Module):
     def forward(self, x) -> Tuple[Tensor, Tensor]:
         embeddings = self.forward_encoder(x)
         logits = self.classifier(embeddings)
-        projections = F.normalize(self.projection(embeddings), dim=1)
-        return logits, projections
+        features = F.normalize(embeddings, dim=1)
+        return logits, features
 
 
 class ContrastiveLoss(nn.Module):
@@ -115,17 +93,11 @@ class ContrastiveLoss(nn.Module):
         return self.hybrid_alpha * loss_sup + (1 - self.hybrid_alpha) * loss_sim
 
 
-class ContrastiveLossClassifier(BasicAugmentation):
+class ContrastiveLossClassifier(ContrastiveAugmentation):
 
     def create_model(self, arch: str, num_classes: int, input_channels: int, config: dict = {}) -> nn.Module:
         encoder = super(ContrastiveLossClassifier, self).create_model(arch, num_classes, input_channels, config=config)
-        return EncoderProjectionModel(
-            encoder,
-            num_classes,
-            projection_dim=self.hparams['projection_dim'],
-            projection_hidden_dim=self.hparams['projection_hidden_dim'],
-            projection_head=self.hparams['projection_head'],
-        )
+        return EncoderClassifierModel(encoder, num_classes)
 
     def get_loss_function(self) -> Callable:
         return ContrastiveLoss(
@@ -142,26 +114,34 @@ class ContrastiveLossClassifier(BasicAugmentation):
                     criterion,
                     scheduler=None,
                     regularizer=None,
-                    show_progress=True):
+                    show_progress=True,
+                    scaler=None):
         model.train()
         total_loss = total_acc = num_samples = 0
         xent = nn.CrossEntropyLoss()
+        use_amp = scaler is not None
         for X, y in tqdm(loader, leave=False, disable=not show_progress):
             y = y.cuda()
             X[0] = X[0].cuda()
             X[1] = X[1].cuda()
             imgs = torch.cat([X[0], X[1]], dim=0)
             optimizer.zero_grad(set_to_none=True)
-            logits, projections = model(imgs)
-            loss_contrastive = criterion(projections, y)
-            logits_view = logits[:y.size(0)]
-            loss = loss_contrastive
-            if self.hparams['xent_weight'] > 0:
-                loss = loss + self.hparams['xent_weight'] * xent(logits_view, y)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                logits, features = model(imgs)
+                loss_contrastive = criterion(features, y)
+                logits_view = logits[:y.size(0)]
+                loss = loss_contrastive
+                if self.hparams['xent_weight'] > 0:
+                    loss = loss + self.hparams['xent_weight'] * xent(logits_view, y)
             if regularizer is not None:
                 loss = loss + regularizer(model)
-            loss.backward()
-            optimizer.step()
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
             if scheduler is not None:
                 scheduler.step()
             total_loss += loss.item() * y.size(0)
@@ -177,7 +157,7 @@ class ContrastiveLossClassifier(BasicAugmentation):
         model.eval()
         total_loss = total_acc = num_samples = 0
         xent = nn.CrossEntropyLoss()
-        with torch.no_grad():
+        with torch.no_grad(), torch.cuda.amp.autocast():
             for X, y in tqdm(loader, leave=False, disable=not show_progress):
                 X, y = X.cuda(), y.cuda()
                 logits, _ = model(X)
@@ -220,9 +200,10 @@ class ContrastiveLossClassifier(BasicAugmentation):
         criterion = self.get_loss_function()
         optimizer, scheduler = self.get_optimizer(par_model, max_epochs=epochs, max_iter=iterations)
         regularizer = self.get_regularizer()
+        scaler = torch.cuda.amp.GradScaler()
         metrics = self.train_model(
             par_model, train_loader, val_loader, optimizer, criterion, epochs,
-            train_args={'scheduler': scheduler, 'regularizer': regularizer, 'show_progress': show_sub_progress},
+            train_args={'scheduler': scheduler, 'regularizer': regularizer, 'show_progress': show_sub_progress, 'scaler': scaler},
             eval_args={'show_progress': show_sub_progress},
             eval_interval=eval_interval, show_progress=show_progress,
             report_tuner=report_tuner,
@@ -241,8 +222,5 @@ class ContrastiveLossClassifier(BasicAugmentation):
             'temperature': 0.07,
             'base_temperature': 0.07,
             'hybrid_alpha': 0.5,
-            'projection_dim': 128,
-            'projection_hidden_dim': 0,
-            'projection_head': 'mlp',
             'xent_weight': 0.0,
         }
