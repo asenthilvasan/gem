@@ -63,7 +63,8 @@ class MobileNetV2(nn.Module):
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.layers(out)
         out = F.relu(self.bn2(self.conv2(out)))
-        out = F.adaptive_avg_pool2d(out, 1)
+        # Same kernel as memory-wrap-SENN (avg_pool2d(out, 4) at 32x32), so both give bit-identical results.
+        out = F.avg_pool2d(out, out.shape[2:])
         out = out.view(out.size(0), -1)
         return out
 

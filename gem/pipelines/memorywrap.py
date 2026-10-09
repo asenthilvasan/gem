@@ -1,3 +1,4 @@
+import copy
 import torch
 import torch.utils.data as datautil
 import numpy as np
@@ -17,9 +18,9 @@ from gem.evaluation import balanced_accuracy_from_predictions
 from gem.utils import is_notebook
 
 if is_notebook():
-    from tqdm.notebook import tqdm, trange
+    from tqdm.notebook import tqdm
 else:
-    from tqdm import tqdm, trange
+    from tqdm import tqdm
 
 
 _EPSILON = 1e-6
@@ -69,6 +70,37 @@ def sparsemax(input: Tensor, dim: int = -1) -> Tensor:
     output = torch.clamp(input - tau, min=0)
     output = output.reshape(original_size)
     return output.transpose(dim, -1)
+
+
+def load_pretrained_encoder(model: nn.Module, path: str, skip_prefixes: Tuple[str, ...]):
+    """Loads encoder weights into `model.encoder` from a GEM or memory-wrap-SENN checkpoint.
+
+    Parameters starting with one of `skip_prefixes` (the new head, and encoder layers the model never uses)
+    are not loaded. Raises if any other parameter is left without pretrained weights.
+    """
+    loaded = torch.load(path, map_location='cpu')
+    state_dict = loaded['model_state_dict'] if isinstance(loaded, dict) and 'model_state_dict' in loaded else loaded
+    if not any(key.startswith('encoder.') for key in state_dict.keys()):
+        state_dict = {
+            f'encoder.{key}': value
+            for key, value in state_dict.items()
+            if not key.startswith('mw.')
+        }
+    # Only encoder weights are taken; heads from pretraining (projection, probe) are dropped.
+    state_dict = {key: value for key, value in state_dict.items()
+                  if key.startswith('encoder.') and not key.startswith(skip_prefixes)}
+    missing, _ = model.load_state_dict(state_dict, strict=False)
+    missing = [key for key in missing if not key.startswith(skip_prefixes)]
+    if missing:
+        raise RuntimeError(f'Pretrained encoder is missing {len(missing)} weights, e.g. {missing[:3]}')
+
+
+def freeze_encoder(model: nn.Module, head_prefix: str):
+    """Freezes every parameter outside the head, and BatchNorm statistics via `model.frozen_encoder`."""
+    for name, param in model.named_parameters():
+        if not name.startswith(head_prefix):
+            param.requires_grad_(False)
+    model.frozen_encoder = True
 
 
 class MLP(nn.Module):
@@ -125,6 +157,14 @@ class MemoryWrapModel(nn.Module):
         self.encoder = encoder
         self.feature_dim = self._prepare_encoder()
         self.mw = BaselineMemory(self.feature_dim, num_classes, distance=distance) if memory_only else MemoryWrapLayer(self.feature_dim, num_classes, distance=distance)
+        self.frozen_encoder = False
+
+    def train(self, mode: bool = True):
+        super(MemoryWrapModel, self).train(mode)
+        # A frozen encoder also keeps its BatchNorm statistics fixed, so the head sees fixed features.
+        if self.frozen_encoder:
+            self.encoder.eval()
+        return self
 
     def _prepare_encoder(self) -> int:
         if hasattr(self.encoder, 'forward_encoder'):
@@ -158,19 +198,10 @@ class MemoryWrapClassifier(BasicAugmentation):
         encoder = super(MemoryWrapClassifier, self).create_model(arch, num_classes, input_channels, config=config)
         model = MemoryWrapModel(encoder, num_classes, distance=self.hparams['distance'], memory_only=self.hparams['memory_only'])
         if self.hparams['pretrained_encoder']:
-            loaded = torch.load(self.hparams['pretrained_encoder'], map_location='cpu')
-            state_dict = loaded['model_state_dict'] if isinstance(loaded, dict) and 'model_state_dict' in loaded else loaded
-            if not any(key.startswith('encoder.') for key in state_dict.keys()):
-                state_dict = {
-                    f'encoder.{key}': value
-                    for key, value in state_dict.items()
-                    if not key.startswith('mw.')
-                }
-            model.load_state_dict(state_dict, strict=False)
+            # Memory Wrap never uses the architecture's own classifier (e.g. `encoder.linear`).
+            load_pretrained_encoder(model, self.hparams['pretrained_encoder'], ('mw.', 'encoder.linear.', 'encoder.fc.'))
         if self.hparams['freeze_encoder']:
-            for name, param in model.named_parameters():
-                if not name.startswith('mw.'):
-                    param.requires_grad_(False)
+            freeze_encoder(model, 'mw.')
         return model
 
     def get_loss_function(self) -> Callable:
@@ -248,45 +279,6 @@ class MemoryWrapClassifier(BasicAugmentation):
                 num_samples += len(X)
         return ClassificationMetrics(total_loss / num_samples, total_acc / num_samples)
 
-    def train_model(self,
-                    model,
-                    train_loader,
-                    val_loader,
-                    optimizer,
-                    criterion,
-                    epochs,
-                    evaluate=True,
-                    train_args={},
-                    eval_args={},
-                    eval_interval=1,
-                    show_progress=True,
-                    report_tuner=False) -> OrderedDict:
-        if report_tuner:
-            from ray import tune
-        metrics = OrderedDict()
-        progbar = trange(epochs, disable=not show_progress)
-        for ep in progbar:
-            train_metrics = self.train_epoch(model, train_loader, optimizer, criterion, **train_args)
-            train_metrics = train_metrics._asdict()
-            for key, value in train_metrics.items():
-                if key not in metrics:
-                    metrics[key] = []
-                metrics[key].append(value)
-            if (evaluate is True) and (val_loader is not None) and (ep == 0 or (ep + 1) % eval_interval == 0):
-                val_metrics = self.evaluate_epoch(model, val_loader, criterion, **eval_args)
-                val_metrics = val_metrics._asdict()
-                for key, value in val_metrics.items():
-                    if 'val_' + key not in metrics:
-                        metrics['val_' + key] = []
-                    metrics['val_' + key].append(value)
-                if report_tuner is True:
-                    tune.report(loss=metrics['val_loss'][-1], accuracy=metrics['val_accuracy'][-1])
-            if 'lr' not in metrics:
-                metrics['lr'] = []
-            metrics['lr'].append(optimizer.param_groups[0]['lr'])
-            progbar.set_postfix(OrderedDict((key, values[-1]) for key, values in metrics.items()))
-        return metrics
-
     def train(self,
               train_data,
               val_data,
@@ -308,19 +300,23 @@ class MemoryWrapClassifier(BasicAugmentation):
                 val_data.transform = test_transform
         else:
             test_transform = train_data.transform
-        self.memory_data = train_data
+        # Memory is drawn from the training images without augmentation, in training as in
+        # memory-wrap-SENN's CIFAR-10 loader, and in evaluation.
+        memory_eval_data = copy.copy(train_data)
+        memory_eval_data.transform = test_transform
+        self.memory_data = memory_eval_data
         self.memory_transform = test_transform
         train_loader = datautil.DataLoader(
-            train_data, batch_size=batch_size, shuffle=True, num_workers=load_workers, pin_memory=True,
+            train_data, batch_size=batch_size, shuffle=True, num_workers=load_workers, persistent_workers=load_workers > 0, pin_memory=True,
         )
         memory_loader = datautil.DataLoader(
-            train_data, batch_size=self.hparams['mem_batch_size'], shuffle=True, num_workers=load_workers, pin_memory=True,
+            memory_eval_data, batch_size=self.hparams['mem_batch_size'], shuffle=True, num_workers=load_workers, persistent_workers=load_workers > 0, pin_memory=True,
         )
         val_loader = datautil.DataLoader(
-            val_data, batch_size=batch_size, shuffle=False, num_workers=load_workers, pin_memory=True,
+            val_data, batch_size=batch_size, shuffle=False, num_workers=load_workers, persistent_workers=load_workers > 0, pin_memory=True,
         ) if val_data is not None else None
         val_memory_loader = datautil.DataLoader(
-            train_data, batch_size=self.hparams['mem_batch_size'], shuffle=True, num_workers=load_workers, pin_memory=True,
+            memory_eval_data, batch_size=self.hparams['mem_batch_size'], shuffle=True, num_workers=load_workers, persistent_workers=load_workers > 0, pin_memory=True,
         ) if val_data is not None else None
         model = self.create_model(architecture, train_data.num_classes, train_data.num_input_channels).cuda()
         if init_weights is not None:

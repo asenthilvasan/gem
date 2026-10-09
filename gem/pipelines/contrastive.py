@@ -1,14 +1,15 @@
 import torch
 import torch.utils.data as datautil
 import torch.nn.functional as F
+import torchvision.transforms as tf
+from PIL import Image
+import numpy as np
 from torch import nn, Tensor
 from typing import Callable, Optional, Tuple
 from collections import OrderedDict
 
-from gem.pipelines.common import ClassificationMetrics
-from gem.pipelines.distill_visual_priors.contrastive_augmentation import (
-    ContrastiveAugmentation, TwoCropsTransform,
-)
+from gem.pipelines.common import BasicAugmentation, ClassificationMetrics
+from gem.pipelines.distill_visual_priors.contrastive_augmentation import TwoCropsTransform
 from gem.utils import is_notebook
 
 if is_notebook():
@@ -17,12 +18,36 @@ else:
     from tqdm import tqdm
 
 
-class EncoderClassifierModel(nn.Module):
+class ProjectionHead(nn.Module):
 
-    def __init__(self, encoder: nn.Module, num_classes: int):
-        super(EncoderClassifierModel, self).__init__()
+    def __init__(self, in_features: int, hidden_dim: int, out_dim: int, head: str):
+        super(ProjectionHead, self).__init__()
+        if head == 'identity':
+            self.net = nn.Identity()
+        elif head == 'linear':
+            self.net = nn.Linear(in_features, out_dim)
+        elif head == 'mlp':
+            hidden_dim = in_features if hidden_dim <= 0 else hidden_dim
+            self.net = nn.Sequential(
+                nn.Linear(in_features, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, out_dim),
+            )
+        else:
+            raise ValueError(f'Unknown projection head: {head}')
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class EncoderProjectionModel(nn.Module):
+
+    def __init__(self, encoder: nn.Module, num_classes: int, projection_dim: int, projection_hidden_dim: int,
+                 projection_head: str):
+        super(EncoderProjectionModel, self).__init__()
         self.encoder = encoder
         self.feature_dim = self._prepare_encoder()
+        self.projection = ProjectionHead(self.feature_dim, projection_hidden_dim, projection_dim, projection_head)
         self.classifier = nn.Linear(self.feature_dim, num_classes)
 
     def _prepare_encoder(self) -> int:
@@ -45,11 +70,12 @@ class EncoderClassifierModel(nn.Module):
             return self.encoder.forward_encoder(x)
         return self.encoder(x)
 
-    def forward(self, x) -> Tuple[Tensor, Tensor]:
+    def forward(self, x) -> Tuple[Tensor, Tensor, Tensor]:
         embeddings = self.forward_encoder(x)
-        logits = self.classifier(embeddings)
-        features = F.normalize(embeddings, dim=1)
-        return logits, features
+        # Linear probe on detached features: it scores the representation without training the encoder.
+        logits = self.classifier(embeddings.detach())
+        projections = F.normalize(self.projection(embeddings), dim=1)
+        return logits, projections, embeddings
 
 
 class ContrastiveLoss(nn.Module):
@@ -80,7 +106,8 @@ class ContrastiveLoss(nn.Module):
         log_prob = logits - torch.log((logits.exp() * not_self).sum(dim=1, keepdim=True) + 1e-12)
         positives = mask.sum(dim=1).clamp(min=1)
         loss = -(mask * log_prob).sum(dim=1).div(positives)
-        loss = loss * (self.temperature / self.base_temperature)
+        if self.base_temperature is not None:
+            loss = loss * (self.temperature / self.base_temperature)
         return loss.mean()
 
     def forward(self, features: Tensor, labels: Tensor) -> Tensor:
@@ -93,11 +120,51 @@ class ContrastiveLoss(nn.Module):
         return self.hybrid_alpha * loss_sup + (1 - self.hybrid_alpha) * loss_sim
 
 
-class ContrastiveLossClassifier(ContrastiveAugmentation):
+class ContrastiveLossClassifier(BasicAugmentation):
 
     def create_model(self, arch: str, num_classes: int, input_channels: int, config: dict = {}) -> nn.Module:
         encoder = super(ContrastiveLossClassifier, self).create_model(arch, num_classes, input_channels, config=config)
-        return EncoderClassifierModel(encoder, num_classes)
+        return EncoderProjectionModel(
+            encoder,
+            num_classes,
+            projection_dim=self.hparams['projection_dim'],
+            projection_hidden_dim=self.hparams['projection_hidden_dim'],
+            projection_head=self.hparams['projection_head'],
+        )
+
+    def get_optimizer(self, model: nn.Module, max_epochs: int, max_iter: int):
+        net = model.module if isinstance(model, nn.DataParallel) else model
+        probe_params = list(net.classifier.parameters())
+        probe_ids = {id(p) for p in probe_params}
+        optimizer = torch.optim.SGD([
+            {'params': [p for p in net.parameters() if id(p) not in probe_ids]},
+            # The probe has its own fixed settings so that tuning lr and decay only changes the encoder.
+            {'params': probe_params, 'lr': self.hparams['probe_lr'], 'weight_decay': 0.0},
+        ], lr=self.hparams['lr'], momentum=0.9, weight_decay=self.hparams['weight_decay'])
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iter)
+        return optimizer, scheduler
+
+    def get_data_transforms(self, dataset) -> Tuple[Callable, Callable]:
+        train_transform, test_transform = super(ContrastiveLossClassifier, self).get_data_transforms(dataset)
+        if not self.hparams['contrastive_aug']:
+            return train_transform, test_transform
+        # SimCLR-style views, as in memory-wrap-SENN's contrastive_augmentation.
+        pil_data = isinstance(dataset[0][0], Image.Image)
+        img_size = np.asarray(dataset[0][0]).shape[:2] if pil_data else tuple(dataset[0][0].shape[-2:])
+        transforms = [] if pil_data else [tf.ToTensor()]
+        transforms.append(tf.RandomResizedCrop(img_size, scale=(0.2, 1.0)))
+        if self.hparams['hflip']:
+            transforms.append(tf.RandomHorizontalFlip())
+        if self.hparams['vflip']:
+            transforms.append(tf.RandomVerticalFlip())
+        transforms += [
+            tf.RandomApply([tf.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
+            tf.RandomGrayscale(p=0.2),
+        ]
+        if pil_data:
+            transforms.append(tf.ToTensor())
+        normalize = [t for t in test_transform.transforms if isinstance(t, tf.Normalize)]
+        return tf.Compose(transforms + normalize), test_transform
 
     def get_loss_function(self) -> Callable:
         return ContrastiveLoss(
@@ -127,12 +194,12 @@ class ContrastiveLossClassifier(ContrastiveAugmentation):
             imgs = torch.cat([X[0], X[1]], dim=0)
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
-                logits, features = model(imgs)
-                loss_contrastive = criterion(features, y)
-                logits_view = logits[:y.size(0)]
-                loss = loss_contrastive
+                logits, projections, embeddings = model(imgs)
+                labels = torch.cat([y, y])
+                loss = criterion(projections, y) + xent(logits, labels)
                 if self.hparams['xent_weight'] > 0:
-                    loss = loss + self.hparams['xent_weight'] * xent(logits_view, y)
+                    net = model.module if isinstance(model, nn.DataParallel) else model
+                    loss = loss + self.hparams['xent_weight'] * xent(net.classifier(embeddings), labels)
             if regularizer is not None:
                 loss = loss + regularizer(model)
             if use_amp:
@@ -144,9 +211,9 @@ class ContrastiveLossClassifier(ContrastiveAugmentation):
                 optimizer.step()
             if scheduler is not None:
                 scheduler.step()
-            total_loss += loss.item() * y.size(0)
-            total_acc += (logits_view.argmax(dim=-1) == y).sum().item()
-            num_samples += y.size(0)
+            total_loss += loss.item() * labels.size(0)
+            total_acc += (logits.argmax(dim=-1) == labels).sum().item()
+            num_samples += labels.size(0)
         return ClassificationMetrics(total_loss / num_samples, total_acc / num_samples)
 
     def evaluate_epoch(self,
@@ -160,7 +227,7 @@ class ContrastiveLossClassifier(ContrastiveAugmentation):
         with torch.no_grad(), torch.cuda.amp.autocast():
             for X, y in tqdm(loader, leave=False, disable=not show_progress):
                 X, y = X.cuda(), y.cuda()
-                logits, _ = model(X)
+                logits = model(X)[0]
                 loss = xent(logits, y)
                 total_loss += loss.item() * len(X)
                 total_acc += (logits.argmax(dim=-1) == y).sum().item()
@@ -187,10 +254,10 @@ class ContrastiveLossClassifier(ContrastiveAugmentation):
             if val_data is not None:
                 val_data.transform = test_transform
         train_loader = datautil.DataLoader(
-            train_data, batch_size=batch_size, shuffle=True, num_workers=load_workers, pin_memory=True, drop_last=True,
+            train_data, batch_size=batch_size, shuffle=True, num_workers=load_workers, persistent_workers=load_workers > 0, pin_memory=True, drop_last=True,
         )
         val_loader = datautil.DataLoader(
-            val_data, batch_size=batch_size, shuffle=False, num_workers=load_workers, pin_memory=True
+            val_data, batch_size=batch_size, shuffle=False, num_workers=load_workers, persistent_workers=load_workers > 0, pin_memory=True
         ) if val_data is not None else None
         model = self.create_model(architecture, train_data.num_classes, train_data.num_input_channels).cuda()
         if init_weights is not None:
@@ -222,5 +289,10 @@ class ContrastiveLossClassifier(ContrastiveAugmentation):
             'temperature': 0.07,
             'base_temperature': 0.07,
             'hybrid_alpha': 0.5,
+            'projection_dim': 128,
+            'projection_hidden_dim': 0,
+            'projection_head': 'identity',
             'xent_weight': 0.0,
+            'probe_lr': 0.1,
+            'contrastive_aug': True,
         }

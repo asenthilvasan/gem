@@ -10,7 +10,7 @@ from typing import Tuple, Callable, Optional, Union
 from collections import OrderedDict, namedtuple
 
 from gem.loader import InstanceLoader
-from gem.utils import is_notebook
+from gem.utils import is_notebook, tune_report
 from gem.evaluation import predict_class_scores, balanced_accuracy_from_predictions
 
 if is_notebook():
@@ -233,9 +233,6 @@ class LearningMethod(ABC):
             `viz_utils.plot_training_history`.
         """
 
-        if report_tuner:
-            from ray import tune
-        
         metrics = OrderedDict()
         progbar = trange(epochs, disable=not show_progress)
         for ep in progbar:
@@ -262,7 +259,7 @@ class LearningMethod(ABC):
                 
                 if report_tuner is True:
                     
-                    tune.report(loss=metrics['val_loss'][-1],
+                    tune_report(loss=metrics['val_loss'][-1],
                                 loss_avg5=np.mean(metrics['val_loss'][-5:]),
                                 accuracy=metrics['val_accuracy'][-1],
                                 accuracy_avg5=np.mean(metrics['val_accuracy'][-5:])
@@ -349,10 +346,10 @@ class LearningMethod(ABC):
     
         # Create data loaders
         train_loader = datautil.DataLoader(
-            train_data, batch_size=batch_size, shuffle=True, num_workers=load_workers, pin_memory=True
+            train_data, batch_size=batch_size, shuffle=True, num_workers=load_workers, persistent_workers=load_workers > 0, pin_memory=True
         )
         val_loader = datautil.DataLoader(
-            val_data, batch_size=batch_size, shuffle=False, num_workers=load_workers, pin_memory=True
+            val_data, batch_size=batch_size, shuffle=False, num_workers=load_workers, persistent_workers=load_workers > 0, pin_memory=True
         ) if val_data is not None else None
     
         # Create model
