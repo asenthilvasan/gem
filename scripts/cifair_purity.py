@@ -12,6 +12,9 @@ it exists.
 Example (from the gem/ directory, one split per GPU):
     python scripts/cifair_purity.py --split 0 --run-dir /workspace/gem_results/cifair/split_0 \\
         --out /workspace/gem_results/cifair_purity/split_0
+
+To retrain only Scratch MW with a longer schedule (same chosen settings and seeds) and score it against the
+SupCon models of an earlier run, add --scratch-epochs 1000 --reuse-supcon /workspace/gem_results/cifair_purity/split_0
 """
 
 import sys, os
@@ -98,6 +101,9 @@ def main():
     parser.add_argument('--load-workers', type=int, default=2)
     parser.add_argument('--ray-cpus', type=int, default=None)
     parser.add_argument('--ray-temp-dir', default=None)
+    parser.add_argument('--scratch-epochs', type=int, default=None, help='Scratch MW epochs (default: the run\'s --epochs)')
+    parser.add_argument('--reuse-supcon', default=None,
+                        help='--out of an earlier run of this script whose SupCon MW models are linked instead of retrained')
     args = parser.parse_args()
 
     import ray
@@ -109,6 +115,15 @@ def main():
     os.makedirs(out, exist_ok=True)
     settings = {cell: read_json(os.path.join(src, f'search_{cell}.json')) for cell in CELLS}
     seeds = range(run_args['final_runs'])
+    if args.reuse_supcon:
+        prev = os.path.join(args.reuse_supcon, f'split{split}')
+        for seed in seeds:
+            for cell in CELLS:
+                if cell == 'SM':
+                    continue
+                for name in (f'{cell}_seed{seed}.pt', f'final_{cell}_seed{seed}.json'):
+                    if not os.path.exists(os.path.join(out, name)):
+                        os.symlink(os.path.join(prev, name), os.path.join(out, name))
 
     gem_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     paths = [gem_root, os.path.join(gem_root, 'scripts'), os.environ.get('PYTHONPATH', '')]
@@ -120,7 +135,7 @@ def main():
     def retrain(cell, seed):
         model = os.path.join(out, f'{cell}_seed{seed}.pt')
         extra = {}
-        epochs = run_args['epochs']
+        epochs = args.scratch_epochs or run_args['epochs']
         if cell != 'SM':
             extra = {'pretrained_encoder': os.path.join(src, f'supcon_trainval_seed{seed}.pt')}
             epochs = run_args['down_epochs']
