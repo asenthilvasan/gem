@@ -37,7 +37,8 @@ import numpy as np
 GEM_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 DATASET = 'cifair10'
-ARCH = 'mobilenet'
+ARCH = 'wrn-16-8'          # GEM's ciFAIR-10 backbone (bash_scripts/bench_cifair10.sh)
+LEGACY_ARCH = 'mobilenet'  # runs whose args.json predates --arch
 METRIC = 'accuracy_avg5'
 SUPCON_CELLS = ['ULfz', 'UMfz', 'UMft']
 SCRATCH_CELLS = ['SM', 'SL']
@@ -71,6 +72,11 @@ def write_json(path, data):
     with open(tmp, 'w') as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, path)
+
+
+def run_arch(run_args):
+    """ The backbone of a run from its args.json. """
+    return run_args.get('arch', LEGACY_ARCH)
 
 
 # --- search spaces -----------------------------------------------------------
@@ -117,7 +123,7 @@ def search_space(cell, args):
 # --- training ----------------------------------------------------------------
 
 def train_once(pipeline_name, setting, extra_hparams, data_root, train_split, epochs, seed,
-               load_workers, save=None, test_split=None):
+               load_workers, *, arch, save=None, test_split=None):
     """ Trains one model with a chosen setting; optionally saves it and evaluates it on `test_split`. """
     import torch
     from gem.loader import InstanceLoader
@@ -132,7 +138,7 @@ def train_once(pipeline_name, setting, extra_hparams, data_root, train_split, ep
     train_data = datasets.build_instance(DATASET, data_root, train_split)
     t0 = time.time()
     model, metrics = pipeline.train(
-        train_data, None, batch_size=setting['batch_size'], epochs=epochs, architecture=ARCH,
+        train_data, None, batch_size=setting['batch_size'], epochs=epochs, architecture=arch,
         show_progress=False, load_workers=load_workers)
     result = {'train_loss': float(metrics['loss'][-1]), 'train_accuracy': float(metrics['accuracy'][-1]),
               'epochs': epochs, 'train_minutes': (time.time() - t0) / 60}
@@ -183,7 +189,7 @@ class Runner:
             'hparams': {**fixed, **(extra_hparams or {}), **space.get('hparams', {})},
             'epochs': epochs,
             'pipeline': pipeline,
-            'architecture': ARCH,
+            'architecture': a.arch,
             'init_weights': None,
             'dataset': DATASET,
             'data_root': self.data_root,
@@ -239,7 +245,8 @@ class Runner:
             log(f'split {split}: pretraining the chosen SupCon setting on train{split}')
             task = self.remote(train_once)
             result = ray.get(task.remote('contrastive', supcon, {}, self.data_root, f'train{split}',
-                                         self.args.epochs, 0, self.args.load_workers, save=path + '.part'))
+                                         self.args.epochs, 0, self.args.load_workers, arch=self.args.arch,
+                                         save=path + '.part'))
             os.replace(path + '.part', path)
             write_json(self.path(split, 'supcon_train.json'), result)
         return path
@@ -256,19 +263,19 @@ class Runner:
             out = {}
             if not os.path.exists(encoder):
                 pre = train_once('contrastive', supcon, {}, data_root, trainval, a.epochs, seed, workers,
-                                 save=encoder + '.part')
+                                 arch=a.arch, save=encoder + '.part')
                 os.replace(encoder + '.part', encoder)
                 out['pretrain'] = pre
             for cell in cells:
                 pipeline = 'linear' if cell == 'ULfz' else 'memorywrap'
                 out[cell] = train_once(pipeline, downstream[cell], {'pretrained_encoder': encoder}, data_root,
-                                       trainval, a.down_epochs, seed, workers, test_split=test)
+                                       trainval, a.down_epochs, seed, workers, arch=a.arch, test_split=test)
             return out
 
         def scratch_seed(seed, cell, setting):
             pipeline = 'linear' if cell == 'SL' else 'memorywrap'
             return {cell: train_once(pipeline, setting, {}, data_root, trainval, a.epochs, seed, workers,
-                                     test_split=test)}
+                                     arch=a.arch, test_split=test)}
 
         jobs = {}
         supcon_cells = [c for c in SUPCON_CELLS if c in settings]
@@ -338,7 +345,7 @@ def report(args, all_settings, all_results):
     lines = ['# ciFAIR-10 GEM results', '',
              f'GEM protocol: {args.trials} ASHA trials per search (reduction factor 2), splits {args.splits}, '
              f'{args.final_runs} final runs per split on trainval (500 images), evaluated on test0 (10,000 images). '
-             f'MobileNetV2, SGD with momentum 0.9 and a cosine schedule.', '',
+             f'{args.arch}, SGD with momentum 0.9 and a cosine schedule.', '',
              '## Summary', '',
              '| Cell | Pretraining epochs | Head/fine-tuning epochs | Test accuracy | Balanced accuracy | n |',
              '|---|---|---|---|---|---|']
@@ -376,6 +383,7 @@ def main():
     parser.add_argument('--splits', type=int, nargs='+', default=[0, 1, 2])
     parser.add_argument('--cells', nargs='+', default=SUPCON_CELLS + SCRATCH_CELLS,
                         choices=SUPCON_CELLS + SCRATCH_CELLS)
+    parser.add_argument('--arch', default=ARCH, help=f'backbone (GEM on ciFAIR-10: {ARCH})')
     parser.add_argument('--trials', type=int, default=250, help='ASHA trials per search (GEM: 250)')
     parser.add_argument('--epochs', type=int, default=500,
                         help='max epochs for SupCon pretraining and scratch cells (GEM: 500)')
@@ -408,7 +416,11 @@ def main():
     ray.init(num_cpus=args.ray_cpus, include_dashboard=False, _temp_dir=args.ray_temp_dir,
              runtime_env={'env_vars': {'PYTHONPATH': os.pathsep.join(p for p in paths if p)}})
     os.makedirs(args.out, exist_ok=True)
-    write_json(os.path.join(args.out, 'args.json'), vars(args))
+    # Resuming reuses finished files, so they must come from the same backbone.
+    args_path = os.path.join(args.out, 'args.json')
+    if os.path.exists(args_path) and run_arch(read_json(args_path)) != args.arch:
+        raise RuntimeError(f'{args.out} holds a {run_arch(read_json(args_path))} run, not {args.arch}; use another --out.')
+    write_json(args_path, vars(args))
 
     Runner(args).run()
     slack('ciFAIR GEM: all cells finished')

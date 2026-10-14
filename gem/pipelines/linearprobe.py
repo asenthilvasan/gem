@@ -36,17 +36,18 @@ class LinearHeadClassifier(CrossEntropyClassifier):
     See `BasicAugmentation` for the remaining hyper-parameters.
     """
 
-    head_prefix = 'encoder.linear.'
-
     def create_model(self, arch: str, num_classes: int, input_channels: int, config: dict = {}) -> nn.Module:
         encoder = super(LinearHeadClassifier, self).create_model(arch, num_classes, input_channels, config=config)
-        if not (hasattr(encoder, 'linear') and isinstance(encoder.linear, nn.Linear)):
-            raise ValueError('The linear pipeline needs an architecture with a `linear` classifier.')
+        # MobileNetV2 names its classifier `linear`, the WRN `fc`.
+        head = next((name for name in ('linear', 'fc') if isinstance(getattr(encoder, name, None), nn.Linear)), None)
+        if head is None:
+            raise ValueError('The linear pipeline needs an architecture with a `linear` or `fc` classifier.')
+        head_prefix = f'encoder.{head}.'
         model = LinearHeadModel(encoder)
         if self.hparams['pretrained_encoder']:
-            load_pretrained_encoder(model, self.hparams['pretrained_encoder'], (self.head_prefix,))
+            load_pretrained_encoder(model, self.hparams['pretrained_encoder'], (head_prefix,))
         if self.hparams['freeze_encoder']:
-            freeze_encoder(model, self.head_prefix)
+            freeze_encoder(model, head_prefix)
         return model
 
     @staticmethod

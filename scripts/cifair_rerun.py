@@ -14,7 +14,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 import argparse
 import statistics
 
-from cifair_gem import SCRATCH_CELLS, train_once, read_json, write_json, log
+from cifair_gem import SCRATCH_CELLS, train_once, read_json, write_json, log, run_arch
 
 
 def main():
@@ -34,6 +34,7 @@ def main():
     import ray
     run_args = read_json(os.path.join(args.run_dir, 'args.json'))
     data_root = run_args['data_root']
+    arch = run_arch(run_args)
     split, cell = args.split, args.cell
     setting = read_json(os.path.join(args.run_dir, f'split{split}', f'search_{cell}.json'))
     out = os.path.join(args.out, f'split{split}')
@@ -48,7 +49,7 @@ def main():
 
     def run(seed):
         return train_once(pipeline, setting, {}, data_root, f'trainval{split}', args.epochs, seed,
-                          args.load_workers, test_split='test0')
+                          args.load_workers, arch=arch, test_split='test0')
 
     seeds = range(run_args['final_runs'])
     jobs = {remote(run).remote(seed): seed for seed in seeds

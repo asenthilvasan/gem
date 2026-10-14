@@ -28,20 +28,20 @@ import re
 
 import numpy as np
 
-from cifair_gem import DATASET, ARCH, train_once, read_json, write_json, log
+from cifair_gem import DATASET, train_once, read_json, write_json, log, run_arch
 
 REPO_PAPER = '/workspace/memory-wrap-SENN/paper'
 CELLS = {'UMfz': 'SupCon -> MW, frozen', 'UMft': 'SupCon -> MW, fine-tuned', 'SM': 'Scratch + MW'}
 PAIRS = [('UMft', 'SM'), ('UMfz', 'SM'), ('UMft', 'UMfz')]
 
 
-def load_model(setting, path):
+def load_model(setting, path, arch):
     import torch
     from gem.loader import InstanceLoader
     hparams = {k: v for k, v in setting['hparams'].items() if k not in ('pretrained_encoder', 'freeze_encoder')}
     pipeline = InstanceLoader('pipelines').build_instance('memorywrap', lr=setting['lr'],
                                                           weight_decay=setting['decay'], **hparams)
-    model = pipeline.create_model(ARCH, 10, 3)
+    model = pipeline.create_model(arch, 10, 3)
     model.load_state_dict(torch.load(path, map_location='cpu'))
     return model.cuda().eval(), pipeline
 
@@ -68,9 +68,9 @@ def score(job):
     sys.path.insert(0, os.path.join(REPO_PAPER, 'scripts'))
     import purity_score as ps  # memory-wrap-SENN/paper/scripts/purity_score.py
 
-    split, seed, settings, paths, data_root, redraws = job
+    split, seed, settings, paths, data_root, redraws, arch = job
     torch.manual_seed(seed)
-    models = {cell: load_model(settings[cell], paths[cell]) for cell in CELLS}
+    models = {cell: load_model(settings[cell], paths[cell], arch) for cell in CELLS}
     test_loader, mem_loader = loaders(models['SM'][1], data_root, split, seed)
     out = {}
     for cell, (model, _) in models.items():
@@ -109,6 +109,7 @@ def main():
     import ray
     run_args = read_json(os.path.join(args.run_dir, 'args.json'))
     data_root = run_args['data_root']
+    arch = run_arch(run_args)
     split = args.split
     src = os.path.join(args.run_dir, f'split{split}')
     out = os.path.join(args.out, f'split{split}')
@@ -140,7 +141,7 @@ def main():
             extra = {'pretrained_encoder': os.path.join(src, f'supcon_trainval_seed{seed}.pt')}
             epochs = run_args['down_epochs']
         result = train_once('memorywrap', settings[cell], extra, data_root, f'trainval{split}', epochs, seed,
-                            args.load_workers, save=model + '.part', test_split='test0')
+                            args.load_workers, arch=arch, save=model + '.part', test_split='test0')
         os.replace(model + '.part', model)
         return result
 
@@ -163,7 +164,7 @@ def main():
     for seed in seeds:
         if not os.path.exists(os.path.join(out, f'purity_seed{seed}.json')):
             ckpts = {cell: os.path.join(out, f'{cell}_seed{seed}.pt') for cell in CELLS}
-            jobs[remote(score).remote((split, seed, settings, ckpts, data_root, args.redraws))] = seed
+            jobs[remote(score).remote((split, seed, settings, ckpts, data_root, args.redraws, arch))] = seed
     pending = list(jobs)
     while pending:
         done, pending = ray.wait(pending, num_returns=1)
