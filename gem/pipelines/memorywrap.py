@@ -186,10 +186,17 @@ class MemoryWrapModel(nn.Module):
             return self.encoder.forward_encoder(x)
         return self.encoder(x)
 
-    def forward(self, x, memory_input, return_weights: bool = False):
+    def forward(self, x, memory_input, return_weights: bool = False, return_features: bool = False):
         out = self.forward_encoder(x)
         memory = self.forward_encoder(memory_input)
-        return self.mw(out, memory, return_weights=return_weights)
+        result = self.mw(out, memory, return_weights=return_weights)
+        if return_features:
+            return result, out, memory
+        return result
+
+
+def encode(encoder: nn.Module, x: Tensor) -> Tensor:
+    return encoder.forward_encoder(x) if hasattr(encoder, 'forward_encoder') else encoder(x)
 
 
 class MemoryWrapClassifier(BasicAugmentation):
@@ -202,7 +209,29 @@ class MemoryWrapClassifier(BasicAugmentation):
             load_pretrained_encoder(model, self.hparams['pretrained_encoder'], ('mw.', 'encoder.linear.', 'encoder.fc.'))
         if self.hparams['freeze_encoder']:
             freeze_encoder(model, 'mw.')
+        self.teacher = None
+        if self.hparams['distill_weight'] > 0:
+            if not self.hparams['pretrained_encoder'] or self.hparams['freeze_encoder']:
+                raise ValueError('distill_weight needs a pretrained encoder that is fine-tuned.')
+            # Frozen copy of the pretrained encoder, kept outside the model so checkpoints hold only the student.
+            # It stays in train mode, so its BatchNorm normalizes with the same batch statistics as the student's
+            # (otherwise the two differ even with equal weights); momentum 0 keeps its running statistics fixed.
+            self.teacher = copy.deepcopy(model.encoder).train()
+            for param in self.teacher.parameters():
+                param.requires_grad_(False)
+            for module in self.teacher.modules():
+                if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                    module.momentum = 0.0
         return model
+
+    def distill_loss(self, images: Tensor, features: Tensor) -> Tensor:
+        """ Mean cosine distance between the student's features and the frozen teacher's on the same images.
+
+        Cosine, because Memory Wrap compares features by cosine: only their direction matters for retrieval.
+        """
+        with torch.no_grad():
+            target = encode(self.teacher, images)
+        return (1 - nn.functional.cosine_similarity(features.float(), target.float(), dim=1)).mean()
 
     def get_loss_function(self) -> Callable:
         return nn.CrossEntropyLoss()
@@ -231,8 +260,14 @@ class MemoryWrapClassifier(BasicAugmentation):
             memory_input = memory_input.cuda()
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
-                output = model(X, memory_input)
-                loss = criterion(output, y)
+                if self.teacher is None:
+                    output = model(X, memory_input)
+                    loss = criterion(output, y)
+                else:
+                    # Distillation keeps both sides of the retrieval, queries and memory, near the teacher.
+                    output, feat, memory_feat = model(X, memory_input, return_features=True)
+                    distill = (self.distill_loss(X, feat) + self.distill_loss(memory_input, memory_feat)) / 2
+                    loss = criterion(output, y) + self.hparams['distill_weight'] * distill
             if regularizer is not None:
                 loss = loss + regularizer(model)
             if use_amp:
@@ -319,6 +354,8 @@ class MemoryWrapClassifier(BasicAugmentation):
             memory_eval_data, batch_size=self.hparams['mem_batch_size'], shuffle=True, num_workers=load_workers, persistent_workers=load_workers > 0, pin_memory=True,
         ) if val_data is not None else None
         model = self.create_model(architecture, train_data.num_classes, train_data.num_input_channels).cuda()
+        if self.teacher is not None:
+            self.teacher.cuda()
         if init_weights is not None:
             model = self.load_weights(model, init_weights)
         par_model = nn.DataParallel(model).cuda() if multi_gpu else model
@@ -408,4 +445,6 @@ class MemoryWrapClassifier(BasicAugmentation):
             'eval_memory_runs': 5,
             'pretrained_encoder': None,
             'freeze_encoder': False,
+            # Weight of the cosine distance to a frozen copy of the pretrained encoder while fine-tuning (DVP-style).
+            'distill_weight': 0.0,
         }

@@ -38,7 +38,7 @@ PAIRS = [('UMft', 'SM'), ('UMfz', 'SM'), ('UMft', 'UMfz')]
 def load_model(setting, path, arch):
     import torch
     from gem.loader import InstanceLoader
-    hparams = {k: v for k, v in setting['hparams'].items() if k not in ('pretrained_encoder', 'freeze_encoder')}
+    hparams = {k: v for k, v in setting['hparams'].items() if k not in ('pretrained_encoder', 'freeze_encoder', 'distill_weight')}
     pipeline = InstanceLoader('pipelines').build_instance('memorywrap', lr=setting['lr'],
                                                           weight_decay=setting['decay'], **hparams)
     model = pipeline.create_model(arch, 10, 3)
