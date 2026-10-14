@@ -254,7 +254,7 @@ class ContrastiveLossClassifier(BasicAugmentation):
             if val_data is not None:
                 val_data.transform = test_transform
         train_loader = datautil.DataLoader(
-            train_data, batch_size=batch_size, shuffle=True, num_workers=load_workers, persistent_workers=load_workers > 0, pin_memory=True, drop_last=True,
+            train_data, batch_size=batch_size, shuffle=True, num_workers=load_workers, persistent_workers=load_workers > 0, pin_memory=True, drop_last=False,
         )
         val_loader = datautil.DataLoader(
             val_data, batch_size=batch_size, shuffle=False, num_workers=load_workers, persistent_workers=load_workers > 0, pin_memory=True
