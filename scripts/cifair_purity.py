@@ -101,7 +101,7 @@ def main():
     parser.add_argument('--load-workers', type=int, default=2)
     parser.add_argument('--ray-cpus', type=int, default=None)
     parser.add_argument('--ray-temp-dir', default=None)
-    parser.add_argument('--scratch-epochs', type=int, default=None, help='Scratch MW epochs (default: the run\'s --epochs)')
+    parser.add_argument('--scratch-epochs', type=int, default=None, help='Scratch MW epochs (default: the run\'s)')
     parser.add_argument('--reuse-supcon', default=None,
                         help='--out of an earlier run of this script whose SupCon MW models are linked instead of retrained')
     args = parser.parse_args()
@@ -136,7 +136,8 @@ def main():
     def retrain(cell, seed):
         model = os.path.join(out, f'{cell}_seed{seed}.pt')
         extra = {}
-        epochs = args.scratch_epochs or run_args['epochs']
+        # Runs before --scratch-epochs trained the scratch cells for --epochs.
+        epochs = args.scratch_epochs or run_args.get('scratch_epochs', run_args['epochs'])
         if cell != 'SM':
             extra = {'pretrained_encoder': os.path.join(src, f'supcon_trainval_seed{seed}.pt')}
             epochs = run_args['down_epochs']

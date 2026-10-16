@@ -3,6 +3,7 @@
 Cells (same names as memory-wrap-SENN's svhn_eval.py):
     ULfz  SupCon -> linear head, frozen encoder (linear probe)
     UMfz  SupCon -> Memory Wrap, frozen encoder
+    ULft  SupCon -> linear head, fine-tuned encoder (control for UMft)
     UMft  SupCon -> Memory Wrap, fine-tuned encoder
     SM    Memory Wrap from scratch
     SL    linear head (cross-entropy) from scratch
@@ -10,7 +11,7 @@ Cells (same names as memory-wrap-SENN's svhn_eval.py):
 Per split i (train{i}: 300 images, val{i}: 200, trainval{i}: 500, test0: 10,000), in priority order:
     1. ASHA search for SupCon pretraining on train{i}, scored by a linear probe on val{i}.
     2. Pretrain the chosen SupCon setting on train{i}; this encoder is used for the downstream searches.
-    3. ASHA search for each downstream cell (ULfz, UMfz, UMft) on train{i}/val{i}.
+    3. ASHA search for each downstream cell (ULfz, UMfz, ULft, UMft) on train{i}/val{i}.
     4. Final runs, one per seed: pretrain SupCon on trainval{i}, train every downstream cell on that
        same encoder, evaluate on test0.
     5. SM and SL: ASHA search on train{i}/val{i}, then final runs on trainval{i}, evaluated on test0.
@@ -40,10 +41,13 @@ DATASET = 'cifair10'
 ARCH = 'wrn-16-8'          # GEM's ciFAIR-10 backbone (bash_scripts/bench_cifair10.sh)
 LEGACY_ARCH = 'mobilenet'  # runs whose args.json predates --arch
 METRIC = 'accuracy_avg5'
-SUPCON_CELLS = ['ULfz', 'UMfz', 'UMft']
+SUPCON_CELLS = ['ULfz', 'UMfz', 'ULft', 'UMft']
 SCRATCH_CELLS = ['SM', 'SL']
+LINEAR_CELLS = ('ULfz', 'ULft', 'SL')  # the rest use Memory Wrap
+FINE_TUNED_CELLS = ('ULft', 'UMft')
 CELL_NAMES = {'ULfz': 'SupCon -> Linear, frozen', 'UMfz': 'SupCon -> MW, frozen',
-              'UMft': 'SupCon -> MW, fine-tuned', 'SM': 'Scratch + MW', 'SL': 'Scratch + Linear'}
+              'ULft': 'SupCon -> Linear, fine-tuned', 'UMft': 'SupCon -> MW, fine-tuned',
+              'SM': 'Scratch + MW', 'SL': 'Scratch + Linear'}
 
 
 def log(msg):
@@ -74,9 +78,37 @@ def write_json(path, data):
     os.replace(tmp, path)
 
 
+def cell_pipeline(cell):
+    return 'linear' if cell in LINEAR_CELLS else 'memorywrap'
+
+
 def run_arch(run_args):
     """ The backbone of a run from its args.json. """
     return run_args.get('arch', LEGACY_ARCH)
+
+
+# Settings that every finished file of a run depends on; a resumed run must match them.
+PROTOCOL_KEYS = ('arch', 'trials', 'epochs', 'grace', 'down_epochs', 'down_grace', 'scratch_epochs', 'final_runs')
+
+
+def run_protocol(run_args):
+    """ The protocol settings of a run from its args.json, filling in what older runs did not record. """
+    protocol = {key: run_args.get(key) for key in PROTOCOL_KEYS}
+    protocol['arch'] = run_arch(run_args)
+    if protocol['scratch_epochs'] is None:  # runs before --scratch-epochs trained the scratch cells for --epochs
+        protocol['scratch_epochs'] = run_args.get('epochs')
+    return protocol
+
+
+def git_commit():
+    import subprocess
+    try:
+        head = subprocess.run(['git', '-C', GEM_ROOT, 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True)
+        dirty = subprocess.run(['git', '-C', GEM_ROOT, 'status', '--porcelain', '--untracked-files=no'],
+                               capture_output=True, text=True, check=True)
+        return head.stdout.strip() + ('-dirty' if dirty.stdout.strip() else '')
+    except (OSError, subprocess.CalledProcessError):
+        return None
 
 
 # --- search spaces -----------------------------------------------------------
@@ -110,13 +142,10 @@ def search_space(cell, args):
         fixed = {'loss': 'supcon', 'base_temperature': None, 'hflip': True, 'contrastive_aug': True}
         return 'contrastive', space, fixed, args.epochs, args.grace
     if cell in SUPCON_CELLS:
-        pipeline = 'linear' if cell == 'ULfz' else 'memorywrap'
-        fixed = {**basic_aug, 'freeze_encoder': cell != 'UMft'}
-        return pipeline, dict(gem_space), fixed, args.down_epochs, args.down_grace
-    if cell == 'SM':
-        return 'memorywrap', dict(gem_space), dict(basic_aug), args.epochs, args.grace
-    if cell == 'SL':
-        return 'linear', dict(gem_space), dict(basic_aug), args.epochs, args.grace
+        fixed = {**basic_aug, 'freeze_encoder': cell not in FINE_TUNED_CELLS}
+        return cell_pipeline(cell), dict(gem_space), fixed, args.down_epochs, args.down_grace
+    if cell in SCRATCH_CELLS:
+        return cell_pipeline(cell), dict(gem_space), dict(basic_aug), args.scratch_epochs, args.grace
     raise ValueError(cell)
 
 
@@ -267,14 +296,12 @@ class Runner:
                 os.replace(encoder + '.part', encoder)
                 out['pretrain'] = pre
             for cell in cells:
-                pipeline = 'linear' if cell == 'ULfz' else 'memorywrap'
-                out[cell] = train_once(pipeline, downstream[cell], {'pretrained_encoder': encoder}, data_root,
+                out[cell] = train_once(cell_pipeline(cell), downstream[cell], {'pretrained_encoder': encoder}, data_root,
                                        trainval, a.down_epochs, seed, workers, arch=a.arch, test_split=test)
             return out
 
         def scratch_seed(seed, cell, setting):
-            pipeline = 'linear' if cell == 'SL' else 'memorywrap'
-            return {cell: train_once(pipeline, setting, {}, data_root, trainval, a.epochs, seed, workers,
+            return {cell: train_once(cell_pipeline(cell), setting, {}, data_root, trainval, a.scratch_epochs, seed, workers,
                                      arch=a.arch, test_split=test)}
 
         jobs = {}
@@ -312,7 +339,7 @@ class Runner:
         settings = {split: {} for split in a.splits}
         results = {split: {} for split in a.splits}
         # Most important first: the frozen SupCon cells, then fine-tuning, then the scratch baselines.
-        phases = [[c for c in ('ULfz', 'UMfz') if c in a.cells], ['UMft'] if 'UMft' in a.cells else []]
+        phases = [[c for c in ('ULfz', 'UMfz') if c in a.cells], [c for c in FINE_TUNED_CELLS if c in a.cells]]
         phases += [[c] for c in SCRATCH_CELLS if c in a.cells]
         for cells in [p for p in phases if p]:
             for split in a.splits:
@@ -355,7 +382,7 @@ def report(args, all_settings, all_results):
         if not accs:
             continue
         pre = str(args.epochs) if cell in SUPCON_CELLS else '-'
-        down = str(args.down_epochs if cell in SUPCON_CELLS else args.epochs)
+        down = str(args.down_epochs if cell in SUPCON_CELLS else args.scratch_epochs)
         lines.append(f'| {CELL_NAMES[cell]} | {pre} | {down} | {100 * np.mean(accs):.2f} ± {100 * np.std(accs, ddof=1):.2f} '
                      f'| {100 * np.mean(baccs):.2f} | {len(accs)} |')
     lines += ['', 'Mean ± sample std over all final runs of all splits.', '', '## Chosen settings per split', '',
@@ -367,7 +394,7 @@ def report(args, all_settings, all_results):
             lines.append(f'| {split} | {label} | {fmt_setting(s)} | {100 * s["val_accuracy_avg5"]:.2f} '
                          f'| {s["minutes"]:.0f} min |')
     lines += ['', '## Per split test accuracy', '', '| Split | ' + ' | '.join(CELL_NAMES[c] for c in SUPCON_CELLS + SCRATCH_CELLS) + ' |',
-              '|---' * 6 + '|']
+              '|---' * (1 + len(SUPCON_CELLS + SCRATCH_CELLS)) + '|']
     for split, results in all_results.items():
         cells = [f'{100 * np.mean([r["accuracy"] for r in results[c]]):.2f}' if c in results else '-'
                  for c in SUPCON_CELLS + SCRATCH_CELLS]
@@ -385,12 +412,14 @@ def main():
                         choices=SUPCON_CELLS + SCRATCH_CELLS)
     parser.add_argument('--arch', default=ARCH, help=f'backbone (GEM on ciFAIR-10: {ARCH})')
     parser.add_argument('--trials', type=int, default=250, help='ASHA trials per search (GEM: 250)')
-    parser.add_argument('--epochs', type=int, default=500,
-                        help='max epochs for SupCon pretraining and scratch cells (GEM: 500)')
+    # 400 + 100 for the two-stage cells keeps the scratch cells at GEM's 500 with the same total budget.
+    parser.add_argument('--epochs', type=int, default=400, help='max epochs for SupCon pretraining')
     parser.add_argument('--grace', type=int, default=50, help='ASHA grace period for --epochs (GEM: 50)')
     parser.add_argument('--down-epochs', type=int, default=100,
                         help='max epochs for the heads and fine-tuning on a SupCon encoder')
     parser.add_argument('--down-grace', type=int, default=10, help='ASHA grace period for --down-epochs')
+    parser.add_argument('--scratch-epochs', type=int, default=None,
+                        help='max epochs for the scratch cells (default: --epochs + --down-epochs, the two-stage total; GEM: 500)')
     parser.add_argument('--final-runs', type=int, default=10, help='final runs per split (GEM: 10)')
     parser.add_argument('--gpus-per-trial', type=float, default=0.25)
     parser.add_argument('--cpus-per-trial', type=float, default=4)
@@ -402,6 +431,8 @@ def main():
     parser.add_argument('--data-root', default=os.path.join(GEM_ROOT, 'datasets', 'cifair'))
     parser.add_argument('--out', default=os.path.join(GEM_ROOT, 'results', 'cifair_gem'))
     args = parser.parse_args()
+    if args.scratch_epochs is None:
+        args.scratch_epochs = args.epochs + args.down_epochs
 
     import ray
     from gem.loader import InstanceLoader
@@ -416,11 +447,14 @@ def main():
     ray.init(num_cpus=args.ray_cpus, include_dashboard=False, _temp_dir=args.ray_temp_dir,
              runtime_env={'env_vars': {'PYTHONPATH': os.pathsep.join(p for p in paths if p)}})
     os.makedirs(args.out, exist_ok=True)
-    # Resuming reuses finished files, so they must come from the same backbone.
+    # Resuming reuses finished files, so they must come from the same backbone and budgets.
     args_path = os.path.join(args.out, 'args.json')
-    if os.path.exists(args_path) and run_arch(read_json(args_path)) != args.arch:
-        raise RuntimeError(f'{args.out} holds a {run_arch(read_json(args_path))} run, not {args.arch}; use another --out.')
-    write_json(args_path, vars(args))
+    if os.path.exists(args_path):
+        old, new = run_protocol(read_json(args_path)), run_protocol(vars(args))
+        diff = {key: (old[key], new[key]) for key in PROTOCOL_KEYS if old[key] != new[key]}
+        if diff:
+            raise RuntimeError(f'{args.out} holds a run with other settings (old, new): {diff}; use another --out.')
+    write_json(args_path, {**vars(args), 'git_commit': git_commit()})
 
     Runner(args).run()
     slack('ciFAIR GEM: all cells finished')
