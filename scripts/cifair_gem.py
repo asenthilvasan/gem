@@ -5,13 +5,15 @@ Cells (same names as memory-wrap-SENN's svhn_eval.py):
     UMfz  SupCon -> Memory Wrap, frozen encoder
     ULft  SupCon -> linear head, fine-tuned encoder (control for UMft)
     UMft  SupCon -> Memory Wrap, fine-tuned encoder
+    ULdv  ULft plus a DVP-style distillation term toward the SupCon encoder, its weight searched with the rest
+    UMdv  UMft plus the same distillation term (on queries and memory)
     SM    Memory Wrap from scratch
     SL    linear head (cross-entropy) from scratch
 
 Per split i (train{i}: 300 images, val{i}: 200, trainval{i}: 500, test0: 10,000), in priority order:
     1. ASHA search for SupCon pretraining on train{i}, scored by a linear probe on val{i}.
     2. Pretrain the chosen SupCon setting on train{i}; this encoder is used for the downstream searches.
-    3. ASHA search for each downstream cell (ULfz, UMfz, ULft, UMft) on train{i}/val{i}.
+    3. ASHA search for each downstream cell (ULfz, UMfz, ULft, UMft, ULdv, UMdv) on train{i}/val{i}.
     4. Final runs, one per seed: pretrain SupCon on trainval{i}, train every downstream cell on that
        same encoder, evaluate on test0.
     5. SM and SL: ASHA search on train{i}/val{i}, then final runs on trainval{i}, evaluated on test0.
@@ -41,12 +43,14 @@ DATASET = 'cifair10'
 ARCH = 'wrn-16-8'          # GEM's ciFAIR-10 backbone (bash_scripts/bench_cifair10.sh)
 LEGACY_ARCH = 'mobilenet'  # runs whose args.json predates --arch
 METRIC = 'accuracy_avg5'
-SUPCON_CELLS = ['ULfz', 'UMfz', 'ULft', 'UMft']
+SUPCON_CELLS = ['ULfz', 'UMfz', 'ULft', 'UMft', 'ULdv', 'UMdv']
 SCRATCH_CELLS = ['SM', 'SL']
-LINEAR_CELLS = ('ULfz', 'ULft', 'SL')  # the rest use Memory Wrap
-FINE_TUNED_CELLS = ('ULft', 'UMft')
+LINEAR_CELLS = ('ULfz', 'ULft', 'ULdv', 'SL')  # the rest use Memory Wrap
+DISTILL_CELLS = ('ULdv', 'UMdv')
+FINE_TUNED_CELLS = ('ULft', 'UMft') + DISTILL_CELLS
 CELL_NAMES = {'ULfz': 'SupCon -> Linear, frozen', 'UMfz': 'SupCon -> MW, frozen',
               'ULft': 'SupCon -> Linear, fine-tuned', 'UMft': 'SupCon -> MW, fine-tuned',
+              'ULdv': 'SupCon -> Linear, fine-tuned + DVP', 'UMdv': 'SupCon -> MW, fine-tuned + DVP',
               'SM': 'Scratch + MW', 'SL': 'Scratch + Linear'}
 
 
@@ -143,7 +147,12 @@ def search_space(cell, args):
         return 'contrastive', space, fixed, args.epochs, args.grace
     if cell in SUPCON_CELLS:
         fixed = {**basic_aug, 'freeze_encoder': cell not in FINE_TUNED_CELLS}
-        return cell_pipeline(cell), dict(gem_space), fixed, args.down_epochs, args.down_grace
+        space = dict(gem_space)
+        if cell in DISTILL_CELLS:
+            # From negligible next to the cross-entropy (plain fine-tuning) to an encoder held at the SupCon one
+            # (close to the frozen cells). Above 100 the term only makes SGD unstable (10-epoch checks, split 0).
+            space['hparams'] = {'distill_weight': tune.loguniform(1e-2, 1e2)}
+        return cell_pipeline(cell), space, fixed, args.down_epochs, args.down_grace
     if cell in SCRATCH_CELLS:
         return cell_pipeline(cell), dict(gem_space), dict(basic_aug), args.scratch_epochs, args.grace
     raise ValueError(cell)
@@ -339,7 +348,8 @@ class Runner:
         settings = {split: {} for split in a.splits}
         results = {split: {} for split in a.splits}
         # Most important first: the frozen SupCon cells, then fine-tuning, then the scratch baselines.
-        phases = [[c for c in ('ULfz', 'UMfz') if c in a.cells], [c for c in FINE_TUNED_CELLS if c in a.cells]]
+        phases = [[c for c in ('ULfz', 'UMfz') if c in a.cells], [c for c in ('ULft', 'UMft') if c in a.cells],
+                  [c for c in DISTILL_CELLS if c in a.cells]]
         phases += [[c] for c in SCRATCH_CELLS if c in a.cells]
         for cells in [p for p in phases if p]:
             for split in a.splits:
@@ -364,6 +374,8 @@ def fmt_setting(s):
     text = f'lr {s["lr"]:.3g}, wd {s["decay"]:.2g}, batch {s["batch_size"]}'
     if s['cell'] == 'supcon':
         text += f', temperature {s["hparams"]["temperature"]:.3g}, head {s["hparams"]["projection_head"]}'
+    if 'distill_weight' in s['hparams']:
+        text += f', distillation weight {s["hparams"]["distill_weight"]:.3g}'
     return text
 
 

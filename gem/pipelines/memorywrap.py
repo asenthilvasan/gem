@@ -199,6 +199,34 @@ def encode(encoder: nn.Module, x: Tensor) -> Tensor:
     return encoder.forward_encoder(x) if hasattr(encoder, 'forward_encoder') else encoder(x)
 
 
+def make_teacher(encoder: nn.Module, hparams: dict) -> nn.Module:
+    """ Frozen copy of the pretrained encoder for DVP-style distillation (`distill_weight`).
+
+    Kept outside the model so checkpoints hold only the student. It stays in train mode, so its BatchNorm normalizes
+    with the same batch statistics as the student's (otherwise the two differ even with equal weights); momentum 0
+    keeps its running statistics fixed.
+    """
+    if not hparams['pretrained_encoder'] or hparams['freeze_encoder']:
+        raise ValueError('distill_weight needs a pretrained encoder that is fine-tuned.')
+    teacher = copy.deepcopy(encoder).train()
+    for param in teacher.parameters():
+        param.requires_grad_(False)
+    for module in teacher.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            module.momentum = 0.0
+    return teacher
+
+
+def distill_loss(teacher: nn.Module, images: Tensor, features: Tensor) -> Tensor:
+    """ Mean cosine distance between the student's features and the frozen teacher's on the same images.
+
+    Cosine, because Memory Wrap compares features by cosine: only their direction matters for retrieval.
+    """
+    with torch.no_grad():
+        target = encode(teacher, images)
+    return (1 - nn.functional.cosine_similarity(features.float(), target.float(), dim=1)).mean()
+
+
 class MemoryWrapClassifier(BasicAugmentation):
 
     def create_model(self, arch: str, num_classes: int, input_channels: int, config: dict = {}) -> nn.Module:
@@ -209,29 +237,11 @@ class MemoryWrapClassifier(BasicAugmentation):
             load_pretrained_encoder(model, self.hparams['pretrained_encoder'], ('mw.', 'encoder.linear.', 'encoder.fc.'))
         if self.hparams['freeze_encoder']:
             freeze_encoder(model, 'mw.')
-        self.teacher = None
-        if self.hparams['distill_weight'] > 0:
-            if not self.hparams['pretrained_encoder'] or self.hparams['freeze_encoder']:
-                raise ValueError('distill_weight needs a pretrained encoder that is fine-tuned.')
-            # Frozen copy of the pretrained encoder, kept outside the model so checkpoints hold only the student.
-            # It stays in train mode, so its BatchNorm normalizes with the same batch statistics as the student's
-            # (otherwise the two differ even with equal weights); momentum 0 keeps its running statistics fixed.
-            self.teacher = copy.deepcopy(model.encoder).train()
-            for param in self.teacher.parameters():
-                param.requires_grad_(False)
-            for module in self.teacher.modules():
-                if isinstance(module, nn.modules.batchnorm._BatchNorm):
-                    module.momentum = 0.0
+        self.teacher = make_teacher(model.encoder, self.hparams) if self.hparams['distill_weight'] > 0 else None
         return model
 
     def distill_loss(self, images: Tensor, features: Tensor) -> Tensor:
-        """ Mean cosine distance between the student's features and the frozen teacher's on the same images.
-
-        Cosine, because Memory Wrap compares features by cosine: only their direction matters for retrieval.
-        """
-        with torch.no_grad():
-            target = encode(self.teacher, images)
-        return (1 - nn.functional.cosine_similarity(features.float(), target.float(), dim=1)).mean()
+        return distill_loss(self.teacher, images, features)
 
     def get_loss_function(self) -> Callable:
         return nn.CrossEntropyLoss()
