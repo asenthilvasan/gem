@@ -13,6 +13,9 @@ Example (from the gem/ directory, one split per GPU):
     python scripts/cifair_purity.py --split 0 --run-dir /workspace/gem_results/cifair/split_0 \\
         --out /workspace/gem_results/cifair_purity/split_0
 
+With --dvp-dir (the --out of a cifair_gem.py run of the DVP cells on the same SupCon encoders), SupCon -> MW,
+fine-tuned + DVP is retrained and scored too, and paired with each of the other cells.
+
 To retrain only Scratch MW with a longer schedule (same chosen settings and seeds) and score it against the
 SupCon models of an earlier run, add --scratch-epochs 1000 --reuse-supcon /workspace/gem_results/cifair_purity/split_0
 """
@@ -33,6 +36,8 @@ from cifair_gem import DATASET, train_once, read_json, write_json, log, run_arch
 REPO_PAPER = '/workspace/memory-wrap-SENN/paper'
 CELLS = {'UMfz': 'SupCon -> MW, frozen', 'UMft': 'SupCon -> MW, fine-tuned', 'SM': 'Scratch + MW'}
 PAIRS = [('UMft', 'SM'), ('UMfz', 'SM'), ('UMft', 'UMfz')]
+DVP_CELL, DVP_NAME = 'UMdv', 'SupCon -> MW, fine-tuned + DVP'
+DVP_PAIRS = [('UMdv', 'UMft'), ('UMdv', 'UMfz'), ('UMdv', 'SM')]
 
 
 def load_model(setting, path, arch):
@@ -68,9 +73,9 @@ def score(job):
     sys.path.insert(0, os.path.join(REPO_PAPER, 'scripts'))
     import purity_score as ps  # memory-wrap-SENN/paper/scripts/purity_score.py
 
-    split, seed, settings, paths, data_root, redraws, arch = job
+    split, seed, settings, paths, data_root, redraws, arch, pairs = job
     torch.manual_seed(seed)
-    models = {cell: load_model(settings[cell], paths[cell], arch) for cell in CELLS}
+    models = {cell: load_model(settings[cell], paths[cell], arch) for cell in paths}
     test_loader, mem_loader = loaders(models['SM'][1], data_root, split, seed)
     out = {}
     for cell, (model, _) in models.items():
@@ -80,7 +85,7 @@ def score(job):
             ps.diagnose(model, test_loader, mem_loader, 'cuda', max_images=2000)
         size = float(re.search(r'Mean support-set size : ([0-9.]+)', buf.getvalue()).group(1))
         out[cell] = {'soft': float(np.mean(soft)), 'coherence': float(np.nanmean(coherence)), 'support_size': size}
-    for a, b in PAIRS:
+    for a, b in pairs:
         coh_a, coh_b, foc_a, foc_b, sft_a, sft_b, n = ps.compare_coherence(
             models[a][0], models[b][0], test_loader, mem_loader, redraws, 'cuda')
         out[f'{a}_vs_{b}'] = {'coherence_a': float(np.nanmean(coh_a)), 'coherence_b': float(np.nanmean(coh_b)),
@@ -102,6 +107,8 @@ def main():
     parser.add_argument('--ray-cpus', type=int, default=None)
     parser.add_argument('--ray-temp-dir', default=None)
     parser.add_argument('--scratch-epochs', type=int, default=None, help='Scratch MW epochs (default: the run\'s)')
+    parser.add_argument('--dvp-dir', default=None,
+                        help='--out of a cifair_gem.py run of the DVP cells; adds SupCon -> MW, fine-tuned + DVP')
     parser.add_argument('--reuse-supcon', default=None,
                         help='--out of an earlier run of this script whose SupCon MW models are linked instead of retrained')
     args = parser.parse_args()
@@ -114,7 +121,13 @@ def main():
     src = os.path.join(args.run_dir, f'split{split}')
     out = os.path.join(args.out, f'split{split}')
     os.makedirs(out, exist_ok=True)
+    cells, pairs = dict(CELLS), list(PAIRS)
     settings = {cell: read_json(os.path.join(src, f'search_{cell}.json')) for cell in CELLS}
+    origin = {cell: src for cell in CELLS}  # where each cell's original final runs are
+    if args.dvp_dir:
+        cells[DVP_CELL], pairs = DVP_NAME, pairs + DVP_PAIRS
+        origin[DVP_CELL] = os.path.join(args.dvp_dir, f'split{split}')
+        settings[DVP_CELL] = read_json(os.path.join(origin[DVP_CELL], f'search_{DVP_CELL}.json'))
     seeds = range(run_args['final_runs'])
     if args.reuse_supcon:
         prev = os.path.join(args.reuse_supcon, f'split{split}')
@@ -148,7 +161,7 @@ def main():
 
     jobs = {}
     for seed in seeds:
-        for cell in CELLS:
+        for cell in cells:
             if not os.path.exists(os.path.join(out, f'final_{cell}_seed{seed}.json')):
                 jobs[remote(retrain).remote(cell, seed)] = (cell, seed)
     log(f'split {split}: retraining {len(jobs)} Memory Wrap models')
@@ -158,14 +171,16 @@ def main():
         cell, seed = jobs[done[0]]
         result = ray.get(done[0])
         write_json(os.path.join(out, f'final_{cell}_seed{seed}.json'), result)
-        log(f'split {split} {cell} seed {seed}: test {result["accuracy"]:.4f}')
+        original = read_json(os.path.join(origin[cell], f'final_{cell}_seed{seed}.json'))['accuracy']
+        log(f'split {split} {cell} seed {seed}: test {result["accuracy"]:.4f} (original final run {original:.4f})')
 
     # 2. Purity, coherence and focus with memory-wrap-SENN's code.
     jobs = {}
     for seed in seeds:
-        if not os.path.exists(os.path.join(out, f'purity_seed{seed}.json')):
-            ckpts = {cell: os.path.join(out, f'{cell}_seed{seed}.pt') for cell in CELLS}
-            jobs[remote(score).remote((split, seed, settings, ckpts, data_root, args.redraws, arch))] = seed
+        done_path = os.path.join(out, f'purity_seed{seed}.json')
+        if not os.path.exists(done_path) or not all(c in read_json(done_path) for c in cells):
+            ckpts = {cell: os.path.join(out, f'{cell}_seed{seed}.pt') for cell in cells}
+            jobs[remote(score).remote((split, seed, settings, ckpts, data_root, args.redraws, arch, pairs))] = seed
     pending = list(jobs)
     while pending:
         done, pending = ray.wait(pending, num_returns=1)
